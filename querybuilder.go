@@ -45,14 +45,16 @@ func BuildQuery(ctx context.Context, db Querier, table string, params url.Values
 		selectCols := make([]interface{}, 0, len(fields))
 		for _, f := range fields {
 			f = strings.TrimSpace(f)
-			// nested like: related_table(col1,col2)
+			// nested like: related_table(col1,col2) or related_table!inner(col1,col2)
 			if strings.Contains(f, "(") && strings.Contains(f, ")") {
-				// extract table and columns
-				re := regexp.MustCompile(`^(\w+)\((.*)\)$`)
+				// extract table, join type, and columns
+				re := regexp.MustCompile(`^(\w+)(!inner)?\((.*)\)$`)
 				m := re.FindStringSubmatch(f)
-				if len(m) == 3 {
+				if len(m) == 4 {
 					relTable := m[1]
-					colsStr := m[2]
+					joinTypeMarker := m[2] // "!inner" or ""
+					colsStr := m[3]
+					useInnerJoin := joinTypeMarker == "!inner"
 
 					// Determine relationship type
 					mainSingular := singularize(table)
@@ -80,10 +82,19 @@ func BuildQuery(ctx context.Context, db Querier, table string, params url.Values
 					} else {
 						// One-to-many relationship: related_table.{main_table_singular}_id = main_table.id
 						// Return an array of JSON objects
-						sub = fmt.Sprintf(
-							"(SELECT COALESCE(json_agg(row_to_json(arr)), '[]'::json) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
-							nestedSelectSQL, relTable, relTable, oneToManyFK, table, relTable,
-						)
+						if useInnerJoin {
+							// INNER JOIN: only include if related rows exist (no COALESCE to array)
+							sub = fmt.Sprintf(
+								"(SELECT json_agg(row_to_json(arr)) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
+								nestedSelectSQL, relTable, relTable, oneToManyFK, table, relTable,
+							)
+						} else {
+							// LEFT JOIN: include all rows, with empty array for no matches
+							sub = fmt.Sprintf(
+								"(SELECT COALESCE(json_agg(row_to_json(arr)), '[]'::json) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
+								nestedSelectSQL, relTable, relTable, oneToManyFK, table, relTable,
+							)
+						}
 					}
 
 					selectCols = append(selectCols, goqu.L(sub))
@@ -295,13 +306,15 @@ func buildNestedSelect(ctx context.Context, db Querier, parentTable string, cols
 	for _, f := range fields {
 		f = strings.TrimSpace(f)
 
-		// Check if this field has nested relations like: stats(views)
+		// Check if this field has nested relations like: stats(views) or stats!inner(views)
 		if strings.Contains(f, "(") && strings.Contains(f, ")") {
-			re := regexp.MustCompile(`^(\w+)\((.*)\)$`)
+			re := regexp.MustCompile(`^(\w+)(!inner)?\((.*)\)$`)
 			m := re.FindStringSubmatch(f)
-			if len(m) == 3 {
+			if len(m) == 4 {
 				nestedTable := m[1]
-				nestedColsStr := m[2]
+				joinTypeMarker := m[2] // "!inner" or ""
+				nestedColsStr := m[3]
+				useInnerJoin := joinTypeMarker == "!inner"
 
 				// Determine relationship type between parentTable and nestedTable
 				parentSingular := singularize(parentTable)
@@ -325,10 +338,20 @@ func buildNestedSelect(ctx context.Context, db Querier, parentTable string, cols
 					selectParts = append(selectParts, subQuery)
 				} else {
 					// One-to-many: return an array of JSON objects
-					subQuery := fmt.Sprintf(
-						"(SELECT COALESCE(json_agg(row_to_json(arr)), '[]'::json) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
-						nestedSelectSQL, nestedTable, nestedTable, oneToManyFK, parentTable, nestedTable,
-					)
+					var subQuery string
+					if useInnerJoin {
+						// INNER JOIN: only include if related rows exist (no COALESCE to array)
+						subQuery = fmt.Sprintf(
+							"(SELECT json_agg(row_to_json(arr)) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
+							nestedSelectSQL, nestedTable, nestedTable, oneToManyFK, parentTable, nestedTable,
+						)
+					} else {
+						// LEFT JOIN: include all rows, with empty array for no matches
+						subQuery = fmt.Sprintf(
+							"(SELECT COALESCE(json_agg(row_to_json(arr)), '[]'::json) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
+							nestedSelectSQL, nestedTable, nestedTable, oneToManyFK, parentTable, nestedTable,
+						)
+					}
 					selectParts = append(selectParts, subQuery)
 				}
 				continue
