@@ -42,7 +42,7 @@ func BuildQuery(ctx context.Context, db Querier, table string, params url.Values
 	if s := params.Get("select"); s != "" {
 		// Parse comma-separated fields but keep parentheses groups together
 		fields := splitSelectFields(s)
-		selectCols := make([]interface{}, 0, len(fields))
+		selectCols := make([]any, 0, len(fields))
 		for _, f := range fields {
 			f = strings.TrimSpace(f)
 			// nested like: related_table(col1,col2) or related_table!inner(col1,col2)
