@@ -42,23 +42,19 @@ func BuildQuery(ctx context.Context, db Querier, table string, params url.Values
 	if s := params.Get("select"); s != "" {
 		// Parse comma-separated fields but keep parentheses groups together
 		fields := splitSelectFields(s)
-		selectCols := make([]interface{}, 0, len(fields))
+		selectCols := make([]any, 0, len(fields))
 		for _, f := range fields {
 			f = strings.TrimSpace(f)
-			// nested like: related_table(col1,col2)
+			// nested like: related_table(col1,col2) or related_table!inner(col1,col2)
 			if strings.Contains(f, "(") && strings.Contains(f, ")") {
-				// extract table and columns
-				re := regexp.MustCompile(`^(\w+)\((.*)\)$`)
+				// extract table, join type, and columns
+				re := regexp.MustCompile(`^(\w+)(!inner)?\((.*)\)$`)
 				m := re.FindStringSubmatch(f)
-				if len(m) == 3 {
+				if len(m) == 4 {
 					relTable := m[1]
-					colsStr := m[2]
-					cols := []string{}
-					if colsStr != "" {
-						for _, c := range strings.Split(colsStr, ",") {
-							cols = append(cols, strings.TrimSpace(c))
-						}
-					}
+					joinTypeMarker := m[2] // "!inner" or ""
+					colsStr := m[3]
+					useInnerJoin := joinTypeMarker == "!inner"
 
 					// Determine relationship type
 					mainSingular := singularize(table)
@@ -69,16 +65,11 @@ func BuildQuery(ctx context.Context, db Querier, table string, params url.Values
 					manyToOneFK := fmt.Sprintf("%s_%s", relSingular, "id")  // e.g., "author_id"
 					oneToManyFK := fmt.Sprintf("%s_%s", mainSingular, "id") // e.g., "post_id"
 
-					// Build column selection for related table
-					colList := ""
-					if len(cols) == 0 {
-						colList = "*"
-					} else {
-						colList = strings.Join(cols, ",")
-					}
-
 					// Check which foreign key exists to determine relationship type
 					isManyToOne := columnExists(ctx, db, table, manyToOneFK)
+
+					// Recursively build the nested select columns
+					nestedSelectSQL := buildNestedSelect(ctx, db, relTable, colsStr, mainSingular)
 
 					var sub string
 					if isManyToOne {
@@ -91,10 +82,19 @@ func BuildQuery(ctx context.Context, db Querier, table string, params url.Values
 					} else {
 						// One-to-many relationship: related_table.{main_table_singular}_id = main_table.id
 						// Return an array of JSON objects
-						sub = fmt.Sprintf(
-							"(SELECT COALESCE(json_agg(row_to_json(arr)), '[]'::json) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
-							colList, relTable, relTable, oneToManyFK, table, relTable,
-						)
+						if useInnerJoin {
+							// INNER JOIN: only include if related rows exist (no COALESCE to array)
+							sub = fmt.Sprintf(
+								"(SELECT json_agg(row_to_json(arr)) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
+								nestedSelectSQL, relTable, relTable, oneToManyFK, table, relTable,
+							)
+						} else {
+							// LEFT JOIN: include all rows, with empty array for no matches
+							sub = fmt.Sprintf(
+								"(SELECT COALESCE(json_agg(row_to_json(arr)), '[]'::json) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
+								nestedSelectSQL, relTable, relTable, oneToManyFK, table, relTable,
+							)
+						}
 					}
 
 					selectCols = append(selectCols, goqu.L(sub))
@@ -292,6 +292,80 @@ func parseParenthesesJoin(param string) *JoinConfig {
 	join.OnRight = "id"
 
 	return join
+}
+
+// buildNestedSelect recursively builds SELECT columns for nested relationships
+func buildNestedSelect(ctx context.Context, db Querier, parentTable string, colsStr string, previousTableSingular string) string {
+	if colsStr == "" {
+		return "*"
+	}
+
+	fields := splitSelectFields(colsStr)
+	var selectParts []string
+
+	for _, f := range fields {
+		f = strings.TrimSpace(f)
+
+		// Check if this field has nested relations like: stats(views) or stats!inner(views)
+		if strings.Contains(f, "(") && strings.Contains(f, ")") {
+			re := regexp.MustCompile(`^(\w+)(!inner)?\((.*)\)$`)
+			m := re.FindStringSubmatch(f)
+			if len(m) == 4 {
+				nestedTable := m[1]
+				joinTypeMarker := m[2] // "!inner" or ""
+				nestedColsStr := m[3]
+				useInnerJoin := joinTypeMarker == "!inner"
+
+				// Determine relationship type between parentTable and nestedTable
+				parentSingular := singularize(parentTable)
+				nestedSingular := singularize(nestedTable)
+
+				manyToOneFK := fmt.Sprintf("%s_%s", nestedSingular, "id")
+				oneToManyFK := fmt.Sprintf("%s_%s", parentSingular, "id")
+
+				// Check which foreign key exists
+				isManyToOne := columnExists(ctx, db, parentTable, manyToOneFK)
+
+				// Recursively build nested select
+				nestedSelectSQL := buildNestedSelect(ctx, db, nestedTable, nestedColsStr, parentSingular)
+
+				if isManyToOne {
+					// Many-to-one: return a single JSON object
+					subQuery := fmt.Sprintf(
+						"(SELECT row_to_json(%s.*) FROM %s WHERE %s.id = %s.%s LIMIT 1) AS %s",
+						nestedTable, nestedTable, nestedTable, parentTable, manyToOneFK, nestedTable,
+					)
+					selectParts = append(selectParts, subQuery)
+				} else {
+					// One-to-many: return an array of JSON objects
+					var subQuery string
+					if useInnerJoin {
+						// INNER JOIN: only include if related rows exist (no COALESCE to array)
+						subQuery = fmt.Sprintf(
+							"(SELECT json_agg(row_to_json(arr)) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
+							nestedSelectSQL, nestedTable, nestedTable, oneToManyFK, parentTable, nestedTable,
+						)
+					} else {
+						// LEFT JOIN: include all rows, with empty array for no matches
+						subQuery = fmt.Sprintf(
+							"(SELECT COALESCE(json_agg(row_to_json(arr)), '[]'::json) FROM (SELECT %s FROM %s WHERE %s.%s = %s.id) arr) AS %s",
+							nestedSelectSQL, nestedTable, nestedTable, oneToManyFK, parentTable, nestedTable,
+						)
+					}
+					selectParts = append(selectParts, subQuery)
+				}
+				continue
+			}
+		}
+
+		// Regular column
+		selectParts = append(selectParts, f)
+	}
+
+	if len(selectParts) == 0 {
+		return "*"
+	}
+	return strings.Join(selectParts, ",")
 }
 
 // splitSelectFields splits top-level comma-separated select fields, keeping parenthesis groups intact
